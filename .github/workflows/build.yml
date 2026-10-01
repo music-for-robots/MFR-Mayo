@@ -1,0 +1,97 @@
+# Builds and validates MFR-Mayo on every push/PR. Pushing a tag like v1.2.3
+# (matching the version in CMakeLists.txt) also publishes a GitHub Release
+# with the zip and installer, using that version's section of CHANGELOG.md.
+name: Build
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  PLUGINVAL_VERSION: v1.0.4
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Read version
+        id: version
+        run: |
+          $cmake = Get-Content CMakeLists.txt -Raw
+          if ($cmake -notmatch 'project\(\w+ VERSION (\d+\.\d+\.\d+)') { throw "No version in CMakeLists.txt" }
+          "version=$($Matches[1])" >> $env:GITHUB_OUTPUT
+
+      - name: Configure
+        run: cmake -S . -B build -A x64
+
+      - name: Build
+        run: cmake --build build --config Release --parallel
+
+      - name: DSP test
+        run: ./build/Release/MayoTest.exe
+
+      - name: pluginval
+        run: |
+          Invoke-WebRequest "https://github.com/Tracktion/pluginval/releases/download/$env:PLUGINVAL_VERSION/pluginval_Windows.zip" -OutFile pluginval.zip
+          Expand-Archive pluginval.zip -DestinationPath pluginval
+          # pluginval.exe is a GUI-subsystem app, so PowerShell won't wait for it
+          # unless it's started with -Wait.
+          $p = Start-Process ./pluginval/pluginval.exe -NoNewWindow -Wait -PassThru -ArgumentList @(
+            "--strictness-level", "10", "--skip-gui-tests", "--validate-in-process",
+            "--validate", "build/Mayo_artefacts/Release/VST3/MFR-Mayo.vst3")
+          if ($p.ExitCode -ne 0) { throw "pluginval failed with exit code $($p.ExitCode)" }
+
+      - name: Install Inno Setup
+        run: |
+          $iscc = @("${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe", "$env:ProgramFiles\Inno Setup 6\ISCC.exe") | Where-Object { Test-Path $_ }
+          if (-not $iscc) { choco install innosetup -y --no-progress }
+
+      - name: Package
+        run: ./scripts/package.ps1
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: MFR-Mayo-${{ steps.version.outputs.version }}-win64
+          path: dist/*
+
+      - name: Publish release
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          if ("${{ github.ref_name }}" -ne "v$env:VERSION") { throw "Tag ${{ github.ref_name }} doesn't match CMakeLists.txt version $env:VERSION" }
+
+          # This version's CHANGELOG section, plus install notes.
+          $log = Get-Content CHANGELOG.md -Raw
+          $pattern = "(?ms)^## \[$([regex]::Escape($env:VERSION))\][^\n]*\n(.*?)(?=^## \[|\z)"
+          $changes = if ($log -match $pattern) { $Matches[1].Trim() } else { "See CHANGELOG.md." }
+          @"
+          $changes
+
+          ## Download
+
+          - **MFR-Mayo-$env:VERSION-win64-setup.exe**: installer. It puts the VST3 in ``Common Files\VST3`` and can also install the standalone app.
+          - **MFR-Mayo-$env:VERSION-win64.zip**: no installer. Copy ``MFR-Mayo.vst3`` into ``C:\Program Files\Common Files\VST3\`` yourself.
+
+          Windows 64-bit, VST3 + Standalone. The installer isn't code-signed, so Windows SmartScreen may warn you. Click **More info**, then **Run anyway**.
+          "@ | Set-Content release-notes.md
+
+          gh release create "${{ github.ref_name }}" dist/* --title "MFR-Mayo $env:VERSION" --notes-file release-notes.md

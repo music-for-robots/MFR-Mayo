@@ -1,0 +1,12 @@
+# Build output
+build/
+build-*/
+out/
+.vs/
+*.user
+
+# Rendered test audio
+*.wav
+
+# Packaged releases
+dist/
